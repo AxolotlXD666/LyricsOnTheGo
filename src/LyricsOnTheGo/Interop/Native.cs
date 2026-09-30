@@ -100,8 +100,51 @@ internal static class Native
     [StructLayout(LayoutKind.Sequential)]
     public struct RECT { public int left, top, right, bottom; }
 
+    // LOCAL CHANGE (2026-09-29): work area of the monitor a window sits on, so the overlay can be
+    // kept out of the taskbar band. Physical pixels, like GetWindowRect (the app is per-monitor aware).
+    [StructLayout(LayoutKind.Sequential)]
+    public struct MONITORINFO { public int cbSize; public RECT rcMonitor; public RECT rcWork; public uint dwFlags; }
+
+    [DllImport("user32.dll")]
+    private static extern IntPtr MonitorFromWindow(IntPtr hwnd, uint dwFlags);
+
+    [DllImport("user32.dll", CharSet = CharSet.Auto)]
+    private static extern bool GetMonitorInfo(IntPtr hMonitor, ref MONITORINFO lpmi);
+
+    /// <summary>Work area (monitor minus the taskbar / other appbars) of the monitor owning hwnd.</summary>
+    public static bool TryGetWorkArea(IntPtr hwnd, out RECT work)
+    {
+        work = new RECT();
+        if (hwnd == IntPtr.Zero) return false;
+        IntPtr mon = MonitorFromWindow(hwnd, 0x00000002 /* MONITOR_DEFAULTTONEAREST */);
+        if (mon == IntPtr.Zero) return false;
+        var mi = new MONITORINFO { cbSize = Marshal.SizeOf<MONITORINFO>() };
+        if (!GetMonitorInfo(mon, ref mi)) return false;
+        work = mi.rcWork;
+        return work.right > work.left && work.bottom > work.top;
+    }
+
     [DllImport("user32.dll")]
     public static extern bool GetWindowRect(IntPtr hWnd, out RECT lpRect);
+
+    // LOCAL CHANGE (2026-09-29): cap how tall the overlay may be dragged. WM_GETMINMAXINFO is the
+    // native way to do it - the struct arrives in the message's lParam (there is NO user32 function
+    // called GetMinMaxInfo; an earlier attempt to P/Invoke one crashed the app with
+    // EntryPointNotFoundException, see memory 2026-09-29).
+    [StructLayout(LayoutKind.Sequential)]
+    public struct POINT { public int X, Y; }
+
+    [StructLayout(LayoutKind.Sequential)]
+    public struct MINMAXINFO
+    {
+        public POINT ptReserved;
+        public POINT ptMaxSize;
+        public POINT ptMaxPosition;
+        public POINT ptMinTrackSize;
+        public POINT ptMaxTrackSize;
+    }
+
+
 
     private const int GWL_EXSTYLE = -20;
 
@@ -249,6 +292,100 @@ internal static class Native
     public static void Show(IntPtr hwnd) => ShowWindow(hwnd, SW_SHOWNA);
 
     /// <summary>Moves + resizes a window in physical pixels (used for karaoke borderless fullscreen).</summary>
+    // LOCAL CHANGE (2026-09-29): HWND_TOPMOST = -1. Re-asserting the topmost z-order is the only way
+    // to stay above the taskbar, which is itself a topmost window.
+    private static readonly IntPtr HWND_TOPMOST = new(-1);
+    private const uint SWP_SHOWWINDOW = 0x0040;   // SWP_NOSIZE/NOMOVE/NOACTIVATE already declared above
+
+    // LOCAL CHANGE (2026-09-29): a pure z-order change made by someone else (e.g. the shell
+    // raising the taskbar) sends us NO message, so the window hook cannot see it. Ask the z-order
+    // directly instead - it is a handful of GetWindow calls, cheap enough to do a few times a second.
+    [DllImport("user32.dll", CharSet = CharSet.Unicode)]
+    private static extern IntPtr FindWindow(string? lpClassName, string? lpWindowName);
+
+    [DllImport("user32.dll")]
+    private static extern IntPtr GetWindow(IntPtr hWnd, uint uCmd);
+
+    private const uint GW_HWNDPREV = 0x0003;
+
+    /// <summary>True when nothing in the few windows above us is the taskbar, i.e. we are on top of it.</summary>
+    [DllImport("user32.dll", CharSet = CharSet.Unicode)]
+    public static extern int RegisterWindowMessage(string? lpString);
+
+    // LOCAL CHANGE (2026-09-29): cache the taskbar handle - the watchdog calls this ~30 times a
+    // second and the handle only changes when Explorer restarts (we re-read it on TaskbarCreated).
+    private static IntPtr _taskbar = IntPtr.Zero;
+
+    public static void RefreshTaskbarHandle() => _taskbar = FindWindow("Shell_TrayWnd", null);
+
+    public static bool IsAboveTaskbar(IntPtr hwnd, int maxSteps = 8)
+    {
+        if (hwnd == IntPtr.Zero) return true;
+        if (_taskbar == IntPtr.Zero) RefreshTaskbarHandle();
+        if (_taskbar == IntPtr.Zero) return true;
+        IntPtr h = hwnd;
+        for (int i = 0; i < maxSteps && h != IntPtr.Zero; i++)
+        {
+            h = GetWindow(h, GW_HWNDPREV);
+            if (h == _taskbar) return false;
+        }
+        return true;
+    }
+
+    // LOCAL CHANGE (2026-09-30). The taskbar was not the only thing burying us: clicking any app
+    // raises that app (and usually the taskbar with it) into the topmost band, above this overlay.
+    // Ask the real question instead - "is a visible window from another process above me?".
+    [DllImport("user32.dll")]
+    private static extern uint GetWindowThreadProcessId(IntPtr hWnd, out uint lpdwProcessId);
+
+    [DllImport("user32.dll")]
+    private static extern bool IsWindowVisible(IntPtr hwnd);
+
+    [DllImport("user32.dll", CharSet=CharSet.Unicode)]
+    private static extern int GetClassName(IntPtr hwnd, System.Text.StringBuilder lpClassName, int nMaxCount);
+
+    // Helper/IME windows live in the topmost band above us all the time. They must NOT count as
+    // "covering", or the watchdog would push us above the IME candidate window (breaking Chinese
+    // input) and burn CPU re-raising for windows that paint nothing.
+    private static readonly string[] HelperClasses =
+    {
+        "IME", "MSCTFIME UI", "Default IME", "ForegroundStaging", "ThumbnailDeviceHelperWnd",
+        "ShellHandwritingCanvas", "GDI+ Hook Window Class", "Cascadia Host Window",
+        "tooltips_class32", "TaskListThumbnailWnd", "NotifyIconOverflowWindow",
+        "Xaml_WindowedPopupClass", "PopupWindow", "Windows.UI.Core.CoreWindow",
+    };
+
+    public static bool IsCovered(IntPtr hwnd, uint ownProcessId, int maxSteps = 12)
+    {
+        if (hwnd == IntPtr.Zero) return false;
+        IntPtr h = hwnd;
+        var sb = new System.Text.StringBuilder(64);
+        for (int i = 0; i < maxSteps; i++)
+        {
+            h = GetWindow(h, GW_HWNDPREV);          // next window above us in the z-order
+            if (h == IntPtr.Zero) return false;      // we are the top of the band
+            uint pid;
+            GetWindowThreadProcessId(h, out pid);
+            if (pid == ownProcessId) continue;      // our own settings/tray windows may sit above us
+            if (!IsWindowVisible(h)) continue;      // hidden windows do not paint anything
+            sb.Length = 0;
+            GetClassName(h, sb, sb.Capacity);
+            string cls = sb.ToString();
+            bool helper = false;
+            foreach (var hc in HelperClasses)
+                if (string.Equals(cls, hc, StringComparison.OrdinalIgnoreCase)) { helper = true; break; }
+            if (helper) continue;
+            return true;
+        }
+        return false;
+    }
+
+    public static void BringToTop(IntPtr hwnd)
+    {
+        if (hwnd == IntPtr.Zero) return;
+        SetWindowPos(hwnd, HWND_TOPMOST, 0, 0, 0, 0, SWP_NOMOVE | SWP_NOSIZE | SWP_NOACTIVATE | SWP_SHOWWINDOW);
+    }
+
     public static void SetBounds(IntPtr hwnd, int x, int y, int w, int h)
     {
         if (hwnd != IntPtr.Zero)

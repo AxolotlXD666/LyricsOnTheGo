@@ -8,10 +8,9 @@ using Windows.UI.Composition.Desktop;
 namespace LyricsOnTheGo.Glass;
 
 /// <summary>
-/// Builds the persistent acrylic visual tree for the glass window:
-/// HostBackdrop (system-blurred desktop behind the window) + a colour tint, clipped
-/// to rounded corners. Because the app owns this brush, Windows does NOT auto-fade it
-/// when the window goes inactive — the whole reason for this native rewrite.
+/// Builds the visual tree for the tint window: a colour tint clipped to rounded corners.
+/// The system-blurred HostBackdrop was removed locally (see Initialize), so this window
+/// is now a plain transparent overlay whose only paint is the user's background colour.
 /// </summary>
 public sealed class GlassHost
 {
@@ -36,19 +35,22 @@ public sealed class GlassHost
         _clipGeometry.Size = new Vector2(width, height);
         root.Clip = _compositor.CreateGeometricClip(_clipGeometry);
 
-        // Acrylic backdrop: the desktop behind the window, system-blurred. Owned by us.
-        var hostBackdrop = _compositor.CreateHostBackdropBrush();
-        var backdrop = _compositor.CreateSpriteVisual();
-        backdrop.RelativeSizeAdjustment = new Vector2(1f, 1f);
-        backdrop.Brush = hostBackdrop;
-        root.Children.InsertAtBottom(backdrop);
+        // LOCAL CHANGE (2026-09-29, at the owner's request): the host backdrop (acrylic blur of
+        // whatever is behind the window) is gone, so the window is no longer a frosted panel.
+        // The only thing painted now is the user's tint, whose opacity is the "background
+        // opacity" setting - 0 means the overlay is fully transparent, i.e. only the lyrics.
+        // To get the blur back, restore the CreateHostBackdropBrush block from git history.
 
         // Tint layer (user's bgcolor @ bgopacity). Updated live from settings.
         _tintBrush = _compositor.CreateColorBrush(Color.FromArgb(255, 0x08, 0x08, 0x08));
         _tint = _compositor.CreateSpriteVisual();
         _tint.RelativeSizeAdjustment = new Vector2(1f, 1f);
         _tint.Brush = _tintBrush;
-        _tint.Opacity = 0.35f;
+        // LOCAL CHANGE (2026-09-29): start fully transparent. This used to be a hardcoded 0.35,
+        // so a launch with background opacity 0 showed a 35% panel until something pushed the
+        // saved setting in (the owner had to nudge the slider to make it right). MainWindow now
+        // pushes the setting right after the glass starts and again on its timer.
+        _tint.Opacity = 0f;
         root.Children.InsertAtTop(_tint);
     }
 

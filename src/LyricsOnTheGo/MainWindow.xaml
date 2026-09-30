@@ -4,7 +4,7 @@
         xmlns:ctrl="clr-namespace:LyricsOnTheGo.Controls"
         Title="LyricsOnTheGo"
         Width="440" Height="340"
-        MinWidth="240" MinHeight="120"
+        MinWidth="240" MinHeight="60"
         Left="200" Top="200"
         WindowStyle="None"
         AllowsTransparency="True"

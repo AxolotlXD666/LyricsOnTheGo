@@ -18,6 +18,11 @@ public partial class MainWindow : Window
 {
     private const int WM_NCHITTEST = 0x0084;
     private const int WM_WINDOWPOSCHANGED = 0x0047;
+    // LOCAL CHANGE (2026-09-29): react to z-order/activation instead of waiting for the timer
+    private const int WM_ACTIVATEAPP = 0x001C;
+    private const int WM_ACTIVATE = 0x0006;
+    private const int SWP_NOZORDER = 0x0004;
+
     private const int HTCLIENT = 1;
     private const int HTCAPTION = 2;
     private const int HTLEFT = 10, HTRIGHT = 11, HTTOP = 12, HTTOPLEFT = 13,
@@ -63,6 +68,18 @@ public partial class MainWindow : Window
     private Diagnostics.DiagnosticsWindow? _diagWindow;
 #endif
     private bool _pinned = true;   // window starts always-on-top
+
+    // LOCAL CHANGE (2026-09-29, at the owner's request): the taskbar is a topmost window too, and
+    // Windows re-raises it (Explorer restart, new topmost window, focus changes), which silently
+    // drops this overlay behind it. Re-assert HWND_TOPMOST periodically so the lyrics can sit
+    // ON the taskbar and stay visible.
+    // LOCAL CHANGE (2026-09-29). There is NO Windows flag for "always above the taskbar" - the taskbar
+    // is just another topmost window and the shell re-raises it whenever the user clicks it. The
+    // shipped music players (QQ Music, NetEase CloudMusic, desktop widgets) all do the same thing: a
+    // fast watchdog that checks the z-order and re-raises the moment the taskbar is above us. 33 ms is
+    // below one frame at 30 Hz, so the dip is not perceivable. The message-driven KickTopmost()
+    // covers the usual cases even faster; this catches the ones the messages miss entirely.
+    private readonly System.Windows.Threading.DispatcherTimer _topmostTimer = new() { Interval = TimeSpan.FromMilliseconds(33) };
     private bool _exiting;         // set only by the tray "Quit" path (the real exit)
 
     private bool _userScrolling;          // user manually scrolled the synced lyrics away
@@ -123,13 +140,30 @@ public partial class MainWindow : Window
     {
         _hwnd = new WindowInteropHelper(this).Handle;
         HwndSource.FromHwnd(_hwnd)?.AddHook(WndProcHook);
+        _taskbarCreatedMsg = Native.RegisterWindowMessage("TaskbarCreated");
+        Native.RefreshTaskbarHandle();
 
         RestoreWindowPlacement();   // apply last size/position BEFORE the glass is placed behind it
+
+        _topmostTimer.Tick += (_, _) => ReassertTopmost();
+        _topmostTimer.Start();
+        ReassertTopmost();
 
         var (x, y, w, h) = GetPhysicalRect();
         _glass = new GlassWindow();
         _glass.Start(x, y, w, h);
         SyncGlass();
+        PushTintToGlass();   // LOCAL CHANGE: apply the saved background opacity immediately
+    }
+
+    /// <summary>LOCAL CHANGE: push the saved background colour + opacity into the glass window.
+    /// Called right after the glass starts and from the periodic timer, so a message dropped during
+    /// startup can never leave a stale tint on screen.</summary>
+    private void PushTintToGlass()
+    {
+        if (_glass is null) return;
+        Color bg = ParseColor(_settings.BgColor, Color.FromRgb(0x08, 0x08, 0x08));
+        _glass.UpdateTint(bg.R, bg.G, bg.B, _settings.BgOpacity / 100f);
     }
 
     /// <summary>Restore the last window bounds, if any and still on a connected monitor.</summary>
@@ -458,10 +492,49 @@ public partial class MainWindow : Window
     }
 #endif
 
+    // LOCAL CHANGE (2026-09-29). Windows has no "always above the taskbar" flag: the taskbar is just
+    // another topmost window, and the shell re-raises it whenever it is clicked. Every app that keeps
+    // a lyrics bar above the taskbar (QQ Music, NetEase CloudMusic, ...) does the same two things:
+    //   1) WS_EX_TOPMOST, and
+    //   2) re-assert it the moment the shell moves something in the band.
+    // The difference between "flickers under the taskbar" and "never visibly dips" is WHEN step 2
+    // runs: inside the message that announces the shell's change (same message-pump turn, before the
+    // next frame is composited), not on a timer afterwards. Hence the synchronous KickTopmost() below
+    // and only a slow 1 s safety net (ReassertTopmost) for cases where no message reaches us at all.
+    private bool _inKick;               // re-entrancy guard: BringToTop re-enters this hook
+    private int _taskbarCreatedMsg;     // registered at startup; Explorer re-raises the taskbar when it restarts
+
+    /// <summary>Synchronous re-assert, called straight from the window procedure.</summary>
+    private void KickTopmost()
+    {
+        if (_hwnd == IntPtr.Zero || !_pinned || _inKick) return;
+        _inKick = true;
+        try
+        {
+            Native.BringToTop(_hwnd);
+            PushTintToGlass();
+            SyncGlass();
+        }
+        finally { _inKick = false; }
+    }
+
+    /// <summary>LOCAL CHANGE: push the window to the top of the topmost band (no focus steal, no move).</summary>
+    private void ReassertTopmost()
+    {
+        if (_hwnd == IntPtr.Zero) return;
+        if (_pinned && Native.IsCovered(_hwnd, (uint)Environment.ProcessId))
+        {
+            Native.BringToTop(_hwnd);
+            PushTintToGlass();
+            SyncGlass();
+        }
+    }
+
     private void OnTogglePin(object sender, RoutedEventArgs e)
     {
         _pinned = !_pinned;
         Topmost = _pinned;
+        ReassertTopmost();
         // Re-glue the glass directly behind the UI window. PositionBehind inherits the UI's
         // topmost band, so the backdrop never floats above (and hides) the UI — the bug that
         // SetTopmost(glass, ...) caused by raising the glass to the top of the topmost band.
@@ -769,8 +842,28 @@ public partial class MainWindow : Window
         // than WPF's LocationChanged/SizeChanged (which miss maximize, Snap, etc.).
         if (msg == WM_WINDOWPOSCHANGED)
         {
+            // LOCAL CHANGE (2026-09-29): a z-order move WITHOUT SWP_NOZORDER means something pushed
+            // us down the topmost band (clicking the taskbar does exactly that). Jump straight back
+            // instead of waiting for the 2 s timer, so the overlay never visibly dips.
+            if (_pinned && (lParam.ToInt64() & SWP_NOZORDER) == 0)
+                KickTopmost();
             SyncGlass();
             return IntPtr.Zero; // not handled — let WPF process it too
+        }
+
+        // LOCAL CHANGE: the taskbar taking the foreground is the other moment we get buried.
+        if (msg is WM_ACTIVATE or WM_ACTIVATEAPP)
+        {
+            // Foreground went to somebody else (the taskbar counts) - we may have just been buried.
+            if (_pinned && msg == WM_ACTIVATEAPP && wParam.ToInt64() == 0)
+                KickTopmost();
+        }
+
+        // Explorer restarting rebuilds the whole band; re-assert then too.
+        if (_taskbarCreatedMsg != 0 && msg == _taskbarCreatedMsg)
+        {
+            Native.RefreshTaskbarHandle();
+            KickTopmost();
         }
 
         if (msg != WM_NCHITTEST)
@@ -871,7 +964,11 @@ public partial class MainWindow : Window
 
         await _smtc.InitializeAsync();
 
-        _pollTimer = new DispatcherTimer { Interval = TimeSpan.FromSeconds(1) };
+        // LOCAL CHANGE (2026-09-30): was 1 s, which put a hard floor on how long "Searching for
+        // lyrics" stayed up after a skip - the overlay only noticed the new song once per second.
+        // 200 ms makes the change feel immediate; the SMTC read is cheap (position is still
+        // interpolated on its own 250 ms timer).
+        _pollTimer = new DispatcherTimer { Interval = TimeSpan.FromMilliseconds(200) };
         _pollTimer.Tick += async (_, _) => await PollAsync();
         _pollTimer.Start();
 
@@ -1131,7 +1228,9 @@ public partial class MainWindow : Window
     // transparency on the lyrics — faithful to whatever glass/colour is behind, no band.
     // Tune this freely; it behaves as absolute pixels up to ~half the viewport height (above
     // that the top and bottom fade bands would meet, so it is clamped to h/2).
-    private const double EdgeFadePx = 30;
+    // LOCAL CHANGE (2026-09-29/30). The edge fade was 30 px, the owner asked for it much weaker
+    // (6 px), then a bit more again: 15 px is half of the original. This one number is the whole knob.
+    private const double EdgeFadePx = 15;
 
     private void UpdateEdgeFade()
     {

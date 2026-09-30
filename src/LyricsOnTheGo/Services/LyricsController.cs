@@ -29,6 +29,7 @@ public sealed class LyricsController
 
     private readonly LyricsAggregator _client = new(LyricsProviders.Entries);
     private string _currentKey = "";
+    private LyricsState? _state;   // LOCAL CHANGE: the retry loop needs to know whether anything showed up
     private CancellationTokenSource? _cts;
 
     public bool PlainFallback { get; set; } = true;
@@ -106,7 +107,46 @@ public sealed class LyricsController
         }
 
         if (!ct.IsCancellationRequested)
+        {
             Raise(new LyricsState(LyricsKind.NotFound));
+            ScheduleRetry(np, ct);   // LOCAL CHANGE (2026-09-30): keep asking
+        }
+    }
+
+    // LOCAL CHANGE (2026-09-30). The lookup used to be one-shot per track: if nothing answered
+    // within the first 2.5 s the overlay stayed on "not found" for the whole song. Our lyrics
+    // pipeline (client -> bridge -> local database) lands about a second after the song changes, so
+    // poll often while empty; the 400 ms only costs anything while lyrics are genuinely missing.
+    private const int RetryWhileEmptyMs = 400;
+    private const int RetryWhileEmptyMaxS = 60;
+
+    private void ScheduleRetry(NowPlaying np, CancellationToken ct)
+    {
+        var cts = _cts;
+        if (cts is null || cts.IsCancellationRequested) return;
+        _ = RetryLoopAsync(np, cts.Token);
+    }
+
+    private async Task RetryLoopAsync(NowPlaying np, CancellationToken ct)
+    {
+        var deadline = DateTime.UtcNow.AddSeconds(RetryWhileEmptyMaxS);
+        while (!ct.IsCancellationRequested && DateTime.UtcNow < deadline)
+        {
+            try { await Task.Delay(RetryWhileEmptyMs, ct); } catch { return; }
+            if (ct.IsCancellationRequested) return;
+
+            var state = _state;
+            if (state != null && (state.Kind == LyricsKind.Synced || state.Kind == LyricsKind.Plain
+                                  || state.Kind == LyricsKind.Instrumental))
+                return;   // something already showed up
+
+            if (np.Key != _currentKey) return;   // song changed, OnTrack owns it now
+
+            LyricsResult result;
+            try { result = await _client.FetchAsync(new LyricsQuery(np.Title, np.Artist, np.Album, np.DurationMs, np.IsBrowser), ct); }
+            catch { continue; }
+            if (result.Found) { Deliver(result); return; }
+        }
     }
 
     /// <summary>Translates a fetched result into a <see cref="LyricsState"/> and raises it, parsing synced LRC into lines.</summary>
@@ -139,5 +179,9 @@ public sealed class LyricsController
         Raise(new LyricsState(LyricsKind.NotFound));
     }
 
-    private void Raise(LyricsState state) => Changed?.Invoke(state);
+    private void Raise(LyricsState state)
+    {
+        _state = state;   // LOCAL CHANGE: remember it for the retry loop
+        Changed?.Invoke(state);
+    }
 }
