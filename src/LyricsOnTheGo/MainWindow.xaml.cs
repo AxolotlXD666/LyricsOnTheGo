@@ -982,6 +982,12 @@ public partial class MainWindow : Window
     private async System.Threading.Tasks.Task PollAsync()
     {
         NowPlaying np = await _smtc.GetNowPlayingAsync();
+
+        // LOCAL CHANGE (2026-09-30, owner's request: "do not go after bilibili/other video sources").
+        // SMTC follows whatever app is playing media, so an Edge tab with a bilibili/YouTube video
+        // playing would otherwise become "the current song". This overlay only ever follows the one
+        // app it was set up for.
+        if (np.HasSession && !MatchesSourceApp(np.SourceAppId)) return;
         _lastNp = np;
         _lastNpAt = DateTime.UtcNow;
 
@@ -1009,6 +1015,20 @@ public partial class MainWindow : Window
         }
 
         _lyrics.OnTrack(np);
+    }
+
+
+    /// <summary>True when the session comes from the app we are meant to follow. Anything else
+    /// (a browser playing a video, a media player, ...) is ignored outright.</summary>
+    private static bool MatchesSourceApp(string? sourceAppId)
+    {
+        var want = (Environment.GetEnvironmentVariable("LYRICS_ONTHEGO_SOURCE") ?? "spotify").Trim().ToLowerInvariant();
+        if (string.IsNullOrEmpty(sourceAppId)) return false;
+        var id = sourceAppId.ToLowerInvariant();
+        if (id.Contains(want)) return true;
+        // keep the app's own browser detection as a hard stop as well
+        if (BrowserDetect.IsBrowser(sourceAppId)) return false;
+        return false;   // strict: only the configured app
     }
 
     private LyricsState _lastState = new(LyricsKind.NoTrack);

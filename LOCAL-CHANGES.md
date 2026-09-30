@@ -35,6 +35,12 @@
 ### 6. global.json
 - `rollForward` 从 `latestFeature` 改成 `latestMajor`，这样只有 .NET 10 SDK 的机器也能直接编译。
 
+### 7. 只跟随一个音源，不碰浏览器/视频站（2026-09-30）
+- Windows 的媒体会话（SMTC）会跟着"当前正在播放的媒体"走：Edge 里放 B 站/YouTube 视频时，
+  这个悬浮窗就会按那个视频的标题去查歌词，看起来像"去 B 站抓歌词"。
+- 现在 `PollAsync` 开头会过滤掉非 Spotify 的会话：只认 `SourceAppId` 里含 `spotify` 的会话，
+  其余（浏览器、播放器、其他应用）一律忽略。默认值可用环境变量 `LYRICS_ONTHEGO_SOURCE` 改。
+
 ## 怎么用
 
 1. `dotnet build src/LyricsOnTheGo/LyricsOnTheGo.csproj -c Release`
